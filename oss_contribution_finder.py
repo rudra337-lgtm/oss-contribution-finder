@@ -285,6 +285,80 @@ def rate_limit(token: str | None = None, timeout: float | None = None) -> dict:
     return api_request(url, token=token, **kwargs)
 
 
+def _label_names(issue: dict[str, Any]) -> list[str]:
+    """Label names from a search API item (labels may be dicts or plain strings)."""
+    labels: list[str] = []
+    for label in issue.get("labels") or []:
+        if isinstance(label, dict):
+            name = label.get("name")
+        else:
+            name = label
+        if isinstance(name, str):
+            labels.append(name.lower())
+    return labels
+
+
+def _competition_score(stars: int) -> float:
+    """Low-star repos accept contributions more readily; #28 tiers."""
+    if stars <= 500:
+        return 1.0
+    if stars <= 5000:
+        return 0.5
+    return 0.1
+
+
+def opportunity_score(issue: dict[str, Any], now: datetime | None = None) -> float:
+    """Score an opportunity by acceptance probability, not popularity (#28).
+
+    Weighted 0..1: low-star (low-competition) 0.35, label 0.35, unassigned 0.20,
+    recency 0.10. Tiers: stars <=500 -> 1.0, <=5000 -> 0.5, else 0.1;
+    "good first issue" -> 1.0, "help wanted" -> 0.7, "bug" -> 0.5;
+      assigned -> 0.2;
+      recency = max(0, 1 - age_days/180) from ``created_at``. Callers may pass
+    ``now`` for deterministic scores; defaults to the current UTC time.
+    Unknown fields (unenriched items, missing labels/assignees/created_at) score
+    conservatively rather than raising.
+    """
+    now = now or datetime.now(timezone.utc)
+
+    stars = _repo_info(issue).get("stargazers_count") or 0
+    if not isinstance(stars, (int, float)):
+        stars = 0
+
+    names = _label_names(issue)
+    label_score = 0.0
+    for name in names:
+        if "good first issue" in name or "good-first-issue" in name:
+            label_score = max(label_score, 1.0)
+        elif "help wanted" in name:
+            label_score = max(label_score, 0.7)
+        elif "bug" in name:
+            label_score = max(label_score, 0.5)
+
+    assignees = issue.get("assignees")
+    assignee = issue.get("assignee")
+    assignee_score = 0.2 if (bool(assignees) or assignee is not None) else 1.0
+
+    recency = 0.0
+    created_at = issue.get("created_at")
+    if isinstance(created_at, str):
+        try:
+            created = datetime.fromisoformat(created_at.replace("Z", "+00:00"))
+            if created.tzinfo is None:
+                created = created.replace(tzinfo=timezone.utc)
+            age_days = (now - created).total_seconds() / 86400.0
+            recency = max(0.0, 1.0 - age_days / 180.0)
+        except ValueError:
+            recency = 0.0
+
+    return (
+        _competition_score(stars) * 0.35
+        + label_score * 0.35
+        + assignee_score * 0.20
+        + recency * 0.10
+    )
+
+
 def _repo_info(opp: dict[str, Any]) -> dict[str, Any]:
     """Return repo metadata, falling back to repository_url when enrich was skipped."""
     repo = opp.get("repo")
@@ -450,9 +524,10 @@ Examples:
     )
     parser.add_argument(
         "--sort",
-        choices=["comments", "reactions", "updated", "friendliness"],
+        choices=["comments", "reactions", "updated", "friendliness", "score"],
         default="updated",
-        help="Sort field (default: updated)",
+        help="Sort field; 'score' ranks by the #28 acceptance-probability "
+             "opportunity_score (computed locally, sent to the API as 'updated')",
     )
     parser.add_argument("--limit", "-n", type=int, default=20, help="Max results")
     parser.add_argument(
@@ -536,6 +611,9 @@ def main():
 
     per_page = args.per_page if args.per_page is not None else min(args.limit, 100)
     labels = args.label if args.label else ["good first issue"]
+    # Local ranking must not leak a client-side key into the GitHub search URL
+    # (the API would 422 on an unknown sort): 'score' searches with 'updated'.
+    api_sort = "updated" if args.sort == "score" else args.sort
     result = search_issues(
         labels=labels,
         language=args.language,
@@ -543,7 +621,7 @@ def main():
         min_stars=args.min_stars,
         created_after=args.created_after,
         updated_after=args.updated_after,
-        sort=args.sort,
+        sort=api_sort,
         per_page=per_page,
         page=args.page,
         token=token,
@@ -593,6 +671,10 @@ def main():
 
     if args.sort == "friendliness":
         items.sort(key=lambda x: x.get("friendliness_score", 0), reverse=True)
+    elif args.sort == "score":
+        for item in items:
+            item["opportunity_score"] = round(opportunity_score(item), 4)
+        items.sort(key=lambda x: x.get("opportunity_score", 0), reverse=True)
 
     # Format output
     formatters = {
